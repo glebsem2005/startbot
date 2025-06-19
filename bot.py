@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO)
 ROUTER_BOT_TOKEN = '8182061892:AAHnfK9k5g4gaaUlEK8plhdFdVHKzHQzYg4'
 
 BOTS = {
-    'Анализ инвестиционной привлекательности': {'token': 'BOT1_TOKEN', 'username': 'sand_bot'},
+    'Анализ инвестиционной привлекательности': {'token': '8165137948:AAHm0sydD1lDnvMcXLsAfKxp09xzCBnbQTo', 'username': 'api_sand_bot'},
     'Скаутинг стартапов': {'token': 'BOT2_TOKEN', 'username': 'Bot2Username'},
     'Подготовка сделки' : {'token': 'BOT2_TOKEN', 'username': 'Bot2Username'},
 }
