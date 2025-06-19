@@ -12,9 +12,9 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = '8182061892:AAHnfK9k5g4gaaUlEK8plhdFdVHKzHQzYg4'
 
 STRATEGIES = {
-    'Анализ инвестиционной привлекательности': {'token': '8165137948:AAHm0sydD1lDnvMcXLsAfKxp09xzCBnbQTo', 'username': '@api_sand_bot'},
-    'Скаутинг стартапов': {'token': 'BOT2_TOKEN', 'username': 'Bot2Username'},
-    'Подготовка сделки' : {'token': 'BOT2_TOKEN', 'username': 'Bot2Username'},
+    'Анализ инвестиционной привлекательности': {'username': 'api_sand_bot'},
+    'Скаутинг стартапов': {'username': 'Bot2Username'},
+    'Подготовка сделки' : {'username': 'Bot2Username'},
 }
 
 bot = Bot(token=TOKEN)
