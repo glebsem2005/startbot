@@ -2,6 +2,7 @@ import logging
 import random
 import smtplib
 import re
+import asyncio
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from aiogram import Bot, Dispatcher, types
@@ -25,7 +26,7 @@ SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
 EMAIL_USER = os.getenv('EMAIL_USER', 'glebsem2005@gmail.com')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', 'kqbkhnqpskiumddc')
 
-# База данных
+# База данных с улучшенными параметрами
 DATABASE_URL = "postgresql://bot_admin:sber@172.20.10.13:5432/sber_bot"
 
 # Боты для перенаправления
@@ -108,63 +109,130 @@ class EmailSender:
 
 email_sender = EmailSender()
 
+async def test_database_connection() -> bool:
+    """Тестирует подключение к базе данных с таймаутом."""
+    try:
+        print("🔍 Тестируем подключение к БД...")
+        
+        # Пробуем подключиться с коротким таймаутом
+        conn = await asyncio.wait_for(
+            asyncpg.connect(DATABASE_URL), 
+            timeout=10.0  # 10 секунд таймаут
+        )
+        
+        # Тестируем запрос
+        result = await asyncio.wait_for(
+            conn.fetchval("SELECT 1"), 
+            timeout=5.0
+        )
+        
+        await conn.close()
+        print("✅ Тестовое подключение успешно")
+        return True
+        
+    except asyncio.TimeoutError:
+        print("❌ Таймаут подключения к БД")
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка тестового подключения: {e}")
+        return False
+
 async def init_database():
-    """Инициализация базы данных."""
+    """Инициализация базы данных с улучшенной обработкой ошибок."""
     global db_pool
     
     try:
-        print("🔗 Пытаемся подключиться к БД...")
+        print("🔗 Начинаем инициализацию БД...")
         print(f"📡 Строка подключения: {DATABASE_URL}")
         
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=1,
-            max_size=5,
-            command_timeout=30
+        # Сначала тестируем подключение
+        if not await test_database_connection():
+            raise Exception("Не удалось установить тестовое подключение")
+        
+        print("🏊 Создаем пул подключений...")
+        
+        # Создаем пул с улучшенными параметрами
+        db_pool = await asyncio.wait_for(
+            asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=3,  # Уменьшаем размер пула
+                command_timeout=20,  # Таймаут команд
+                server_settings={
+                    'jit': 'off',  # Отключаем JIT для стабильности
+                    'application_name': 'telegram_bot'
+                }
+            ),
+            timeout=30.0  # Общий таймаут создания пула
         )
+        
         print("✅ Пул подключений создан")
         
-        # Тестируем подключение и проверяем таблицу
+        # Тестируем пул
         async with db_pool.acquire() as connection:
-            print("📋 Тестируем подключение...")
-            result = await connection.fetchval("SELECT current_database()")
+            print("📋 Тестируем пул подключений...")
+            result = await asyncio.wait_for(
+                connection.fetchval("SELECT current_database()"), 
+                timeout=10.0
+            )
             print(f"✅ Подключение OK, база: {result}")
             
             # Проверяем существование таблицы users
-            table_exists = await connection.fetchval("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = 'users'
-                )
-            """)
+            table_exists = await asyncio.wait_for(
+                connection.fetchval("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'users'
+                    )
+                """),
+                timeout=10.0
+            )
             
             if table_exists:
                 print("✅ Таблица 'users' найдена")
                 
                 # Проверяем структуру таблицы
-                columns = await connection.fetch("""
-                    SELECT column_name, data_type 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'users'
-                    ORDER BY ordinal_position
-                """)
+                columns = await asyncio.wait_for(
+                    connection.fetch("""
+                        SELECT column_name, data_type 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'users'
+                        ORDER BY ordinal_position
+                    """),
+                    timeout=10.0
+                )
                 
                 print("📋 Структура таблицы 'users':")
                 for col in columns:
                     print(f"   - {col['column_name']}: {col['data_type']}")
             else:
                 print("❌ Таблица 'users' НЕ найдена!")
-                raise Exception("Таблица 'users' не существует")
+                # Пытаемся создать таблицу
+                print("🔨 Создаем таблицу 'users'...")
+                await connection.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT UNIQUE NOT NULL,
+                        email VARCHAR(255) NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                print("✅ Таблица 'users' создана")
         
-        logger.info("✅ База данных инициализирована")
+        logger.info("✅ База данных инициализирована успешно")
+        return True
         
+    except asyncio.TimeoutError:
+        print("❌ ТАЙМАУТ при инициализации БД")
+        logger.error("❌ Таймаут инициализации базы данных")
+        return False
     except Exception as e:
         print(f"❌ ДЕТАЛЬНАЯ ОШИБКА: {e}")
         print(f"❌ Тип ошибки: {type(e)}")
         import traceback
         traceback.print_exc()
         logger.error(f"❌ Ошибка инициализации базы данных: {e}")
-        raise
+        return False
 
 async def check_user_authorized(user_id: int) -> bool:
     """Проверяет, авторизован ли пользователь в таблице users."""
@@ -174,13 +242,20 @@ async def check_user_authorized(user_id: int) -> bool:
         
     try:
         async with db_pool.acquire() as connection:
-            # Проверяем в таблице users по столбцу user_id
-            result = await connection.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM users WHERE user_id = $1)",
-                user_id
+            # Проверяем в таблице users по столбцу user_id с таймаутом
+            result = await asyncio.wait_for(
+                connection.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM users WHERE user_id = $1)",
+                    user_id
+                ),
+                timeout=10.0
             )
             print(f"🔍 Проверка пользователя {user_id}: {'✅ найден' if result else '❌ не найден'}")
             return bool(result)
+    except asyncio.TimeoutError:
+        print(f"❌ Таймаут проверки пользователя {user_id}")
+        logger.error(f"Таймаут проверки авторизации пользователя {user_id}")
+        return True  # В случае таймаута пропускаем пользователя
     except Exception as e:
         print(f"❌ Ошибка проверки авторизации: {e}")
         logger.error(f"Ошибка проверки авторизации: {e}")
@@ -194,18 +269,25 @@ async def add_authorized_user(user_id: int, email: str) -> bool:
         
     try:
         async with db_pool.acquire() as connection:
-            # Вставляем в таблицу users только user_id и email
-            await connection.execute('''
-                INSERT INTO users (user_id, email)
-                VALUES ($1, $2)
-                ON CONFLICT (user_id) DO UPDATE SET
-                    email = EXCLUDED.email
-            ''', user_id, email)
+            # Вставляем в таблицу users только user_id и email с таймаутом
+            await asyncio.wait_for(
+                connection.execute('''
+                    INSERT INTO users (user_id, email)
+                    VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        email = EXCLUDED.email
+                ''', user_id, email),
+                timeout=10.0
+            )
         
         print(f"✅ Пользователь {user_id} добавлен с email {email}")
         logger.info(f"Пользователь {user_id} авторизован с email {email}")
         return True
         
+    except asyncio.TimeoutError:
+        print(f"❌ Таймаут добавления пользователя {user_id}")
+        logger.error(f"Таймаут добавления пользователя {user_id}")
+        return False
     except Exception as e:
         print(f"❌ Ошибка добавления пользователя: {e}")
         logger.error(f"Ошибка добавления пользователя: {e}")
@@ -327,6 +409,23 @@ async def reset_auth(message: types.Message, state: FSMContext):
     await state.finish()
     await message.answer("🔄 Состояние сброшено. Отправьте /start для авторизации.")
 
+@dp.message_handler(commands=['dbstatus'])
+async def db_status(message: types.Message):
+    """Проверка статуса БД."""
+    if not db_pool:
+        await message.answer("❌ БД не инициализирована")
+        return
+    
+    try:
+        async with db_pool.acquire() as connection:
+            result = await asyncio.wait_for(
+                connection.fetchval("SELECT current_timestamp"),
+                timeout=5.0
+            )
+            await message.answer(f"✅ БД работает: {result}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка БД: {e}")
+
 @dp.message_handler()
 async def handle_other_messages(message: types.Message):
     """Обработка всех остальных сообщений."""
@@ -338,16 +437,34 @@ async def on_startup(dp):
     """Инициализация при запуске бота."""
     try:
         print("🚀 Запускаем инициализацию...")
-        await init_database()
-        print("🚀 Бот-маршрутизатор запущен")
-        logger.info("🚀 Бот-маршрутизатор запущен")
+        db_success = await init_database()
+        
+        if db_success:
+            print("🚀 Бот-маршрутизатор запущен с БД")
+            logger.info("🚀 Бот-маршрутизатор запущен с БД")
+        else:
+            print("⚠️ Бот запущен БЕЗ базы данных")
+            logger.warning("⚠️ Бот запущен БЕЗ базы данных")
+            
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА: {e}")
         import traceback
         traceback.print_exc()
         logger.error(f"❌ Ошибка запуска: {e}")
-        # НЕ ПОДНИМАЕМ ИСКЛЮЧЕНИЕ - пусть бот работает без БД
         print("⚠️ Бот запущен БЕЗ базы данных")
 
+async def on_shutdown(dp):
+    """Очистка ресурсов при остановке."""
+    global db_pool
+    if db_pool:
+        print("🔌 Закрываем пул подключений...")
+        await db_pool.close()
+        print("✅ Пул подключений закрыт")
+
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    executor.start_polling(
+        dp, 
+        skip_updates=True, 
+        on_startup=on_startup,
+        on_shutdown=on_shutdown
+    )
