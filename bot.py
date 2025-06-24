@@ -43,6 +43,10 @@ dp = Dispatcher(bot, storage=storage)
 # Глобальный пул подключений к БД
 db_pool = None
 
+# Локальное хранение авторизованных пользователей (резерв на случай недоступности БД)
+authorized_users_cache = set()  # Множество telegram_id авторизованных пользователей
+users_email_cache = {}  # Словарь {telegram_id: email} для хранения email пользователей
+
 class UserStates(StatesGroup):
     WAITING_EMAIL = State()
     WAITING_CODE = State()
@@ -137,7 +141,45 @@ async def test_database_connection() -> bool:
         print(f"❌ Ошибка тестового подключения: {e}")
         return False
 
-async def init_database():
+async def load_authorized_users_to_cache():
+    """Загружает список авторизованных пользователей из БД в кэш."""
+    global authorized_users_cache, users_email_cache
+    
+    if not db_pool:
+        print("⚠️ БД недоступна, кэш не может быть загружен")
+        return False
+        
+    try:
+        async with db_pool.acquire() as connection:
+            # Загружаем всех авторизованных пользователей
+            users = await asyncio.wait_for(
+                connection.fetch("SELECT users_id, email FROM users"),
+                timeout=15.0
+            )
+            
+            # Очищаем старый кэш
+            authorized_users_cache.clear()
+            users_email_cache.clear()
+            
+            # Заполняем кэш
+            for user in users:
+                user_id = user['users_id']  # Используем правильное имя столбца
+                email = user['email']
+                authorized_users_cache.add(user_id)
+                users_email_cache[user_id] = email
+            
+            print(f"✅ Загружено {len(authorized_users_cache)} пользователей в кэш")
+            logger.info(f"Загружено {len(authorized_users_cache)} пользователей в кэш")
+            return True
+            
+    except asyncio.TimeoutError:
+        print("❌ Таймаут загрузки пользователей в кэш")
+        logger.error("Таймаут загрузки пользователей в кэш")
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка загрузки кэша: {e}")
+        logger.error(f"Ошибка загрузки кэша: {e}")
+        return False
     """Инициализация базы данных с улучшенной обработкой ошибок."""
     global db_pool
     
@@ -205,6 +247,18 @@ async def init_database():
                 print("📋 Структура таблицы 'users':")
                 for col in columns:
                     print(f"   - {col['column_name']}: {col['data_type']}")
+                    
+                # Проверяем, какой именно столбец для user_id используется
+                user_id_column = None
+                for col in columns:
+                    if col['column_name'] in ['user_id', 'users_id', 'telegram_id']:
+                        user_id_column = col['column_name']
+                        break
+                
+                if user_id_column:
+                    print(f"✅ Найден столбец для Telegram ID: {user_id_column}")
+                else:
+                    print("❌ Не найден столбец для Telegram ID!")
             else:
                 print("❌ Таблица 'users' НЕ найдена!")
                 # Пытаемся создать таблицу
@@ -212,7 +266,7 @@ async def init_database():
                 await connection.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                         id SERIAL PRIMARY KEY,
-                        user_id BIGINT UNIQUE NOT NULL,
+                        users_id BIGINT UNIQUE NOT NULL,
                         email VARCHAR(255) NOT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
@@ -220,6 +274,10 @@ async def init_database():
                 print("✅ Таблица 'users' создана")
         
         logger.info("✅ База данных инициализирована успешно")
+        
+        # Загружаем пользователей в кэш
+        await load_authorized_users_to_cache()
+        
         return True
         
     except asyncio.TimeoutError:
@@ -235,63 +293,90 @@ async def init_database():
         return False
 
 async def check_user_authorized(user_id: int) -> bool:
-    """Проверяет, авторизован ли пользователь в таблице users."""
+    """Проверяет, авторизован ли пользователь (сначала в кэше, затем в БД)."""
+    
+    # Сначала проверяем в локальном кэше
+    if user_id in authorized_users_cache:
+        print(f"✅ Пользователь {user_id} найден в кэше")
+        return True
+    
+    # Если БД недоступна, полагаемся только на кэш
     if not db_pool:
-        print(f"⚠️ БД недоступна, пропускаем пользователя {user_id}")
-        return True  # Пропускаем всех если БД недоступна
+        print(f"❌ БД недоступна, пользователь {user_id} НЕ найден в кэше - отказываем в доступе")
+        return False
         
     try:
         async with db_pool.acquire() as connection:
-            # Проверяем в таблице users по столбцу user_id с таймаутом
+            # Проверяем в БД
             result = await asyncio.wait_for(
                 connection.fetchval(
-                    "SELECT EXISTS(SELECT 1 FROM users WHERE user_id = $1)",
+                    "SELECT EXISTS(SELECT 1 FROM users WHERE users_id = $1)",
                     user_id
                 ),
                 timeout=10.0
             )
-            print(f"🔍 Проверка пользователя {user_id}: {'✅ найден' if result else '❌ не найден'}")
+            
+            # Если пользователь найден в БД, добавляем в кэш
+            if result:
+                authorized_users_cache.add(user_id)
+                # Получаем email для кэша
+                email = await asyncio.wait_for(
+                    connection.fetchval(
+                        "SELECT email FROM users WHERE users_id = $1",
+                        user_id
+                    ),
+                    timeout=5.0
+                )
+                if email:
+                    users_email_cache[user_id] = email
+                    
+            print(f"🔍 Проверка пользователя {user_id} в БД: {'✅ найден' if result else '❌ не найден'}")
             return bool(result)
+            
     except asyncio.TimeoutError:
-        print(f"❌ Таймаут проверки пользователя {user_id}")
+        print(f"❌ Таймаут проверки пользователя {user_id} - полагаемся на кэш")
         logger.error(f"Таймаут проверки авторизации пользователя {user_id}")
-        return True  # В случае таймаута пропускаем пользователя
+        return user_id in authorized_users_cache
     except Exception as e:
-        print(f"❌ Ошибка проверки авторизации: {e}")
+        print(f"❌ Ошибка проверки авторизации: {e} - полагаемся на кэш")
         logger.error(f"Ошибка проверки авторизации: {e}")
-        return True  # В случае ошибки пропускаем пользователя
+        return user_id in authorized_users_cache
 
-async def add_authorized_user(user_id: int, email: str) -> bool:
-    """Добавляет пользователя в таблицу users (id, user_id, email)."""
+async def remove_authorized_user(user_id: int) -> bool:
+    """Удаляет пользователя из БД и кэша (выход из аккаунта)."""
+    
+    # Сначала удаляем из кэша
+    authorized_users_cache.discard(user_id)  # discard не вызывает ошибку если элемента нет
+    users_email_cache.pop(user_id, None)  # pop с default не вызывает ошибку
+    
     if not db_pool:
-        print(f"⚠️ БД недоступна, не можем добавить пользователя {user_id}")
-        return False
+        print(f"⚠️ БД недоступна, пользователь {user_id} удален только из кэша")
+        logger.warning(f"Пользователь {user_id} удален только из локального кэша")
+        return True  # Считаем успешным, так как удален из кэша
         
     try:
         async with db_pool.acquire() as connection:
-            # Вставляем в таблицу users только user_id и email с таймаутом
-            await asyncio.wait_for(
-                connection.execute('''
-                    INSERT INTO users (user_id, email)
-                    VALUES ($1, $2)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        email = EXCLUDED.email
-                ''', user_id, email),
+            # Удаляем из БД
+            result = await asyncio.wait_for(
+                connection.execute(
+                    'DELETE FROM users WHERE users_id = $1', 
+                    user_id
+                ),
                 timeout=10.0
             )
         
-        print(f"✅ Пользователь {user_id} добавлен с email {email}")
-        logger.info(f"Пользователь {user_id} авторизован с email {email}")
+        print(f"✅ Пользователь {user_id} удален из БД и кэша")
+        logger.info(f"Пользователь {user_id} вышел из аккаунта")
         return True
         
     except asyncio.TimeoutError:
-        print(f"❌ Таймаут добавления пользователя {user_id}")
-        logger.error(f"Таймаут добавления пользователя {user_id}")
-        return False
+        print(f"❌ Таймаут удаления пользователя {user_id} из БД, но удален из кэша")
+        logger.error(f"Таймаут удаления пользователя {user_id} из БД")
+        return True  # Удален из кэша
     except Exception as e:
-        print(f"❌ Ошибка добавления пользователя: {e}")
-        logger.error(f"Ошибка добавления пользователя: {e}")
-        return False
+        print(f"❌ Ошибка удаления пользователя из БД: {e}, но удален из кэша")
+        logger.error(f"Ошибка удаления пользователя из БД: {e}")
+        return True  # Удален из кэша
 
 def is_valid_email(email: str) -> bool:
     """Проверяет валидность email."""
@@ -329,6 +414,9 @@ async def show_strategies(message: types.Message):
         bot_url = f"https://t.me/{username}?start=ref_{message.from_user.id}"
         # Добавляем кнопку
         keyboard.add(types.InlineKeyboardButton(name, url=bot_url))
+    
+    # Добавляем кнопку выхода из аккаунта
+    keyboard.add(types.InlineKeyboardButton("🚪 Выйти из аккаунта", callback_data="logout"))
     
     await message.answer(
         "✅ Вы авторизованы!\n\n"
@@ -403,28 +491,116 @@ async def process_verification_code(message: types.Message, state: FSMContext):
         )
         await state.finish()
 
-@dp.message_handler(commands=['reset'])
-async def reset_auth(message: types.Message, state: FSMContext):
-    """Сброс авторизации (для тестирования)."""
-    await state.finish()
-    await message.answer("🔄 Состояние сброшено. Отправьте /start для авторизации.")
+@dp.callback_query_handler(lambda c: c.data == 'logout')
+async def process_logout(callback_query: types.CallbackQuery):
+    """Обработка выхода из аккаунта."""
+    user_id = callback_query.from_user.id
+    
+    # Показываем, что обрабатываем запрос
+    await callback_query.answer("Выходим из аккаунта...")
+    
+    # Удаляем пользователя из БД
+    success = await remove_authorized_user(user_id)
+    
+    if success:
+        await callback_query.message.edit_text(
+            "🚪 Вы успешно вышли из аккаунта!\n\n"
+            "Для повторного входа отправьте команду /start"
+        )
+        logger.info(f"Пользователь {user_id} вышел из аккаунта")
+    else:
+        await callback_query.message.edit_text(
+            "❌ Ошибка при выходе из аккаунта.\n"
+            "Попробуйте позже или обратитесь к администратору.\n\n"
+            "Команды: /start - авторизация"
+        )
+
+@dp.message_handler(commands=['logout'])
+async def logout_command(message: types.Message):
+    """Команда для выхода из аккаунта."""
+    user_id = message.from_user.id
+    
+    # Проверяем, авторизован ли пользователь
+    is_authorized = await check_user_authorized(user_id)
+    
+    if not is_authorized:
+        await message.answer(
+            "❌ Вы не авторизованы.\n"
+            "Используйте /start для входа в систему."
+        )
+        return
+    
+    # Создаем клавиатуру подтверждения
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("✅ Да", callback_data="confirm_logout"),
+        types.InlineKeyboardButton("❌ Нет", callback_data="cancel_logout")
+    )
+    
+    await message.answer(
+        "🚪 Вы уверены, что хотите выйти из аккаунта?\n\n"
+        "После выхода потребуется повторная авторизация по email.",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == 'confirm_logout')
+async def confirm_logout(callback_query: types.CallbackQuery):
+    """Подтверждение выхода из аккаунта."""
+    user_id = callback_query.from_user.id
+    
+    await callback_query.answer("Выходим из аккаунта...")
+    
+    success = await remove_authorized_user(user_id)
+    
+    if success:
+        await callback_query.message.edit_text(
+            "✅ Вы успешно вышли из аккаунта!\n\n"
+            "Для повторного входа отправьте команду /start"
+        )
+    else:
+        await callback_query.message.edit_text(
+            "❌ Ошибка при выходе из аккаунта.\n"
+            "Попробуйте позже."
+        )
+
+@dp.callback_query_handler(lambda c: c.data == 'cancel_logout')
+async def cancel_logout(callback_query: types.CallbackQuery):
+    """Отмена выхода из аккаунта."""
+    await callback_query.answer("Отменено")
+    await callback_query.message.edit_text(
+        "❌ Выход из аккаунта отменен.\n\n"
+        "Вы остались авторизованы. Используйте /start для доступа к стратегиям."
+    )
 
 @dp.message_handler(commands=['dbstatus'])
 async def db_status(message: types.Message):
-    """Проверка статуса БД."""
-    if not db_pool:
-        await message.answer("❌ БД не инициализирована")
-        return
+    """Проверка статуса БД и кэша."""
+    status_lines = []
     
-    try:
-        async with db_pool.acquire() as connection:
-            result = await asyncio.wait_for(
-                connection.fetchval("SELECT current_timestamp"),
-                timeout=5.0
-            )
-            await message.answer(f"✅ БД работает: {result}")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка БД: {e}")
+    # Статус кэша
+    cache_count = len(authorized_users_cache)
+    status_lines.append(f"📦 Кэш: {cache_count} пользователей")
+    
+    # Статус БД
+    if not db_pool:
+        status_lines.append("❌ БД: не инициализирована")
+    else:
+        try:
+            async with db_pool.acquire() as connection:
+                result = await asyncio.wait_for(
+                    connection.fetchval("SELECT COUNT(*) FROM users"),
+                    timeout=5.0
+                )
+                status_lines.append(f"✅ БД: {result} пользователей")
+        except Exception as e:
+            status_lines.append(f"❌ БД: ошибка - {e}")
+    
+    # Проверка пользователя
+    user_id = message.from_user.id
+    in_cache = user_id in authorized_users_cache
+    status_lines.append(f"👤 Вы в кэше: {'✅' if in_cache else '❌'}")
+    
+    await message.answer("\n".join(status_lines))
 
 @dp.message_handler()
 async def handle_other_messages(message: types.Message):
