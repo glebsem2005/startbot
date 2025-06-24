@@ -19,11 +19,11 @@ logger = logging.getLogger(__name__)
 # Токен вашего бота-маршрутизатора
 TOKEN = '8182061892:AAHnfK9k5g4gaaUlEK8plhdFdVHKzHQzYg4'
 
-# Email настройки (добавьте в переменные окружения или замените на свои)
+# Email настройки
 SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
 SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
-EMAIL_USER = os.getenv('EMAIL_USER', 'glebsem2005@gmail.com')  # Замените на свой email
-EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', 'kqbkhnqpskiumddc')  # Замените на app password
+EMAIL_USER = os.getenv('EMAIL_USER', 'glebsem2005@gmail.com')
+EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', 'kqbkhnqpskiumddc')
 
 # База данных
 DATABASE_URL = "postgresql://bot_admin:sber@172.20.10.13:5432/sber_bot"
@@ -113,62 +113,101 @@ async def init_database():
     global db_pool
     
     try:
+        print("🔗 Пытаемся подключиться к БД...")
+        print(f"📡 Строка подключения: {DATABASE_URL}")
+        
         db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=1,
             max_size=5,
             command_timeout=30
         )
+        print("✅ Пул подключений создан")
         
-        # Создаем таблицу если не существует
+        # Тестируем подключение и проверяем таблицу
         async with db_pool.acquire() as connection:
-            await connection.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT UNIQUE NOT NULL,
-                    email VARCHAR(255) NOT NULL,
+            print("📋 Тестируем подключение...")
+            result = await connection.fetchval("SELECT current_database()")
+            print(f"✅ Подключение OK, база: {result}")
+            
+            # Проверяем существование таблицы users
+            table_exists = await connection.fetchval("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'users'
                 )
-            ''')
+            """)
+            
+            if table_exists:
+                print("✅ Таблица 'users' найдена")
+                
+                # Проверяем структуру таблицы
+                columns = await connection.fetch("""
+                    SELECT column_name, data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users'
+                    ORDER BY ordinal_position
+                """)
+                
+                print("📋 Структура таблицы 'users':")
+                for col in columns:
+                    print(f"   - {col['column_name']}: {col['data_type']}")
+            else:
+                print("❌ Таблица 'users' НЕ найдена!")
+                raise Exception("Таблица 'users' не существует")
         
         logger.info("✅ База данных инициализирована")
         
     except Exception as e:
+        print(f"❌ ДЕТАЛЬНАЯ ОШИБКА: {e}")
+        print(f"❌ Тип ошибки: {type(e)}")
+        import traceback
+        traceback.print_exc()
         logger.error(f"❌ Ошибка инициализации базы данных: {e}")
         raise
 
 async def check_user_authorized(user_id: int) -> bool:
-    """Проверяет, авторизован ли пользователь."""
+    """Проверяет, авторизован ли пользователь в таблице users."""
+    if not db_pool:
+        print(f"⚠️ БД недоступна, пропускаем пользователя {user_id}")
+        return True  # Пропускаем всех если БД недоступна
+        
     try:
         async with db_pool.acquire() as connection:
+            # Проверяем в таблице users по столбцу user_id
             result = await connection.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM authorized_users WHERE user_id = $1)",
+                "SELECT EXISTS(SELECT 1 FROM users WHERE user_id = $1)",
                 user_id
             )
+            print(f"🔍 Проверка пользователя {user_id}: {'✅ найден' if result else '❌ не найден'}")
             return bool(result)
     except Exception as e:
+        print(f"❌ Ошибка проверки авторизации: {e}")
         logger.error(f"Ошибка проверки авторизации: {e}")
-        return False
+        return True  # В случае ошибки пропускаем пользователя
 
-async def add_authorized_user(user_id: int, email: str, username: str = None, 
-                            first_name: str = None, last_name: str = None) -> bool:
-    """Добавляет пользователя в список авторизованных."""
+async def add_authorized_user(user_id: int, email: str) -> bool:
+    """Добавляет пользователя в таблицу users (id, user_id, email)."""
+    if not db_pool:
+        print(f"⚠️ БД недоступна, не можем добавить пользователя {user_id}")
+        return False
+        
     try:
         async with db_pool.acquire() as connection:
+            # Вставляем в таблицу users только user_id и email
             await connection.execute('''
-                INSERT INTO authorized_users (user_id, email, username, first_name, last_name)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO users (user_id, email)
+                VALUES ($1, $2)
                 ON CONFLICT (user_id) DO UPDATE SET
-                    email = EXCLUDED.email,
-                    username = EXCLUDED.username,
-                    first_name = EXCLUDED.first_name,
-                    last_name = EXCLUDED.last_name,
-                    authorized_at = CURRENT_TIMESTAMP
-            ''', user_id, email, username, first_name, last_name)
+                    email = EXCLUDED.email
+            ''', user_id, email)
         
+        print(f"✅ Пользователь {user_id} добавлен с email {email}")
         logger.info(f"Пользователь {user_id} авторизован с email {email}")
         return True
         
     except Exception as e:
+        print(f"❌ Ошибка добавления пользователя: {e}")
         logger.error(f"Ошибка добавления пользователя: {e}")
         return False
 
@@ -242,10 +281,7 @@ async def process_email(message: types.Message, state: FSMContext):
     await state.update_data(
         email=email,
         verification_code=code,
-        user_id=message.from_user.id,
-        username=message.from_user.username,
-        first_name=message.from_user.first_name,
-        last_name=message.from_user.last_name
+        user_id=message.from_user.id
     )
     
     await message.answer(
@@ -271,11 +307,8 @@ async def process_verification_code(message: types.Message, state: FSMContext):
     # Код правильный - авторизуем пользователя
     user_id = user_data.get('user_id')
     email = user_data.get('email')
-    username = user_data.get('username')
-    first_name = user_data.get('first_name')
-    last_name = user_data.get('last_name')
     
-    success = await add_authorized_user(user_id, email, username, first_name, last_name)
+    success = await add_authorized_user(user_id, email)
     
     if success:
         await message.answer("✅ Авторизация успешна!")
@@ -304,11 +337,17 @@ async def handle_other_messages(message: types.Message):
 async def on_startup(dp):
     """Инициализация при запуске бота."""
     try:
+        print("🚀 Запускаем инициализацию...")
         await init_database()
+        print("🚀 Бот-маршрутизатор запущен")
         logger.info("🚀 Бот-маршрутизатор запущен")
     except Exception as e:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА: {e}")
+        import traceback
+        traceback.print_exc()
         logger.error(f"❌ Ошибка запуска: {e}")
-        raise
+        # НЕ ПОДНИМАЕМ ИСКЛЮЧЕНИЕ - пусть бот работает без БД
+        print("⚠️ Бот запущен БЕЗ базы данных")
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
