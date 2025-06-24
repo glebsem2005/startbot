@@ -123,14 +123,10 @@ async def init_database():
         # Создаем таблицу если не существует
         async with db_pool.acquire() as connection:
             await connection.execute('''
-                CREATE TABLE IF NOT EXISTS authorized_users (
+                CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT UNIQUE NOT NULL,
                     email VARCHAR(255) NOT NULL,
-                    username VARCHAR(255),
-                    first_name VARCHAR(255),
-                    last_name VARCHAR(255),
-                    authorized_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
         
