@@ -142,9 +142,12 @@ async def test_database_connection() -> bool:
         return False
 
 async def load_authorized_users_to_cache():
-    global authorized_users_cache, users_email_cache, db_pool  # ✅ Все переменные объявлены
+    """Загружает список авторизованных пользователей из БД в кэш."""
+    global authorized_users_cache, users_email_cache, db_pool
     
-    if not db_pool:  # ✅ Теперь можно использовать
+    if not db_pool:
+        print("⚠️ БД недоступна, кэш не может быть загружен")
+        return False
         
     try:
         async with db_pool.acquire() as connection:
