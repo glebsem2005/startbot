@@ -35,7 +35,7 @@ DATABASE_URL = "postgresql://bot_admin:sber@172.20.10.13:5432/sber_bot"
 
 # Боты для перенаправления
 STRATEGIES = {
-    'Анализ инвестиционной привлекательности': 'sber_investment_bot',
+    'Анализ инвестиционной привлекательности': 'sber__CPNB_investment_bot',
     'Скаутинг стартапов': 'sber_startups_bot',
     'Подготовка сделки': 'sber_investment_bot',
 }
