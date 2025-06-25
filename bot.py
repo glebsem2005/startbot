@@ -14,7 +14,7 @@ import asyncpg
 import os
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Токен вашего бота-маршрутизатора
@@ -26,12 +26,8 @@ SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
 EMAIL_USER = os.getenv('EMAIL_USER', 'glebsem2005@gmail.com')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', 'kqbkhnqpskiumddc')
 
-# База данных - можно изменить параметры подключения
+# База данных
 DATABASE_URL = "postgresql://postgres:jNtiIokjoySRemHIhgvjunFtmBLaRYLr@switchyard.proxy.rlwy.net:17143/railway"
-
-# Альтернативные варианты подключения (раскомментируйте нужный):
-# DATABASE_URL = "postgresql://bot_admin:sber@localhost:5432/sber_bot"  # если БД локально
-# DATABASE_URL = "postgresql://postgres:password@localhost:5432/sber_bot"  # стандартные настройки
 
 # Боты для перенаправления
 STRATEGIES = {
@@ -47,6 +43,9 @@ dp = Dispatcher(bot, storage=storage)
 # Простой кэш авторизованных пользователей
 authorized_users_cache = set()
 users_email_cache = {}
+
+# Пул соединений для оптимизации
+db_pool = None
 
 class UserStates(StatesGroup):
     WAITING_EMAIL = State()
@@ -114,70 +113,100 @@ class EmailSender:
 
 email_sender = EmailSender()
 
-async def get_db_connection():
-    """Создает новое подключение к БД с детальной диагностикой."""
+async def init_db_pool():
+    """Инициализирует пул соединений с БД."""
+    global db_pool
     try:
-        logger.info(f"Попытка подключения к БД: {DATABASE_URL}")
+        logger.info(f"Создание пула соединений к БД...")
         
-        conn = await asyncio.wait_for(
-            asyncpg.connect(DATABASE_URL), 
-            timeout=15.0
+        # Настройки для Railway PostgreSQL
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            command_timeout=30,
+            server_settings={
+                'application_name': 'sber_cpnb_bot',
+            }
         )
         
-        # Тестируем подключение
-        await conn.fetchval("SELECT 1")
-        logger.info("✅ Подключение к БД успешно")
-        return conn
+        # Тестируем пул
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+            
+        logger.info("✅ Пул соединений создан успешно")
+        return True
         
-    except asyncio.TimeoutError:
-        logger.error("❌ Таймаут подключения к БД (15 сек)")
-        return None
-    except asyncpg.InvalidCatalogNameError:
-        logger.error("❌ База данных 'sber_bot' не существует")
-        return None
-    except asyncpg.InvalidPasswordError:
-        logger.error("❌ Неверный пароль для пользователя БД")
-        return None
-    except asyncpg.ConnectionDoesNotExistError:
-        logger.error("❌ Не удается подключиться к серверу БД")
-        return None
     except Exception as e:
-        logger.error(f"❌ Неизвестная ошибка подключения к БД: {type(e).__name__}: {e}")
+        logger.error(f"❌ Ошибка создания пула соединений: {type(e).__name__}: {e}")
+        db_pool = None
+        return False
+
+async def get_db_connection():
+    """Получает соединение из пула."""
+    global db_pool
+    
+    if not db_pool:
+        logger.error("Пул соединений не инициализирован")
         return None
+    
+    try:
+        conn = await db_pool.acquire()
+        return conn
+    except Exception as e:
+        logger.error(f"Ошибка получения соединения: {e}")
+        return None
+
+def release_db_connection(conn):
+    """Возвращает соединение в пул."""
+    global db_pool
+    if db_pool and conn:
+        try:
+            db_pool.release(conn)
+        except Exception as e:
+            logger.error(f"Ошибка возврата соединения в пул: {e}")
+
+async def ensure_table_exists():
+    """Создает таблицу users если она не существует."""
+    conn = await get_db_connection()
+    if not conn:
+        return False
+    
+    try:
+        # Создаем таблицу с правильной структурой
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                users_id BIGINT UNIQUE NOT NULL,
+                email VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Создаем индекс для быстрого поиска
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_users_users_id ON users(users_id)
+        """)
+        
+        logger.info("✅ Таблица users готова")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания таблицы: {e}")
+        return False
+    finally:
+        release_db_connection(conn)
 
 async def load_authorized_users():
     """Загружает авторизованных пользователей из БД в кэш."""
-    logger.info("Попытка загрузки пользователей из БД...")
+    logger.info("Загрузка пользователей из БД...")
     
     conn = await get_db_connection()
     if not conn:
         logger.warning("❌ Не удалось подключиться к БД для загрузки пользователей")
-        logger.info("ℹ️ Бот будет работать только с локальным кэшем")
-        return
+        return False
     
     try:
-        # Сначала проверим, существует ли таблица
-        table_exists = await conn.fetchval("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'users'
-            )
-        """)
-        
-        if not table_exists:
-            logger.warning("⚠️ Таблица 'users' не существует, создаем...")
-            # ИСПРАВЛЕНО: users_id как TEXT
-            await conn.execute("""
-                CREATE TABLE users (
-                    id SERIAL PRIMARY KEY,
-                    users_id TEXT UNIQUE NOT NULL,
-                    email VARCHAR(255) NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            logger.info("✅ Таблица 'users' создана")
-            return
-        
         # Загружаем всех пользователей
         users = await conn.fetch("SELECT users_id, email FROM users")
         
@@ -186,24 +215,25 @@ async def load_authorized_users():
         users_email_cache.clear()
         
         for user in users:
-            user_id_str = user['users_id']  # Это строка
-            user_id_int = int(user_id_str)   # Преобразуем в int для кэша
+            user_id = int(user['users_id'])
             email = user['email']
-            authorized_users_cache.add(user_id_int)
-            users_email_cache[user_id_int] = email
+            authorized_users_cache.add(user_id)
+            users_email_cache[user_id] = email
         
         logger.info(f"✅ Загружено {len(authorized_users_cache)} пользователей в кэш")
+        return True
         
     except Exception as e:
-        logger.error(f"❌ Ошибка загрузки пользователей: {type(e).__name__}: {e}")
+        logger.error(f"❌ Ошибка загрузки пользователей: {e}")
+        return False
     finally:
-        await conn.close()
-
+        release_db_connection(conn)
 
 async def check_user_authorized(user_id: int) -> bool:
     """Проверяет авторизацию пользователя (сначала кэш, потом БД)."""
     # Проверяем кэш
     if user_id in authorized_users_cache:
+        logger.debug(f"Пользователь {user_id} найден в кэше")
         return True
     
     # Проверяем БД
@@ -213,61 +243,70 @@ async def check_user_authorized(user_id: int) -> bool:
         return False
     
     try:
-        # ИСПРАВЛЕНО: преобразуем user_id в строку
-        result = await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE users_id = $1)",
-            str(user_id)  # Преобразуем в строку
+        result = await conn.fetchrow(
+            "SELECT users_id, email FROM users WHERE users_id = $1",
+            user_id
         )
         
         if result:
             # Добавляем в кэш
             authorized_users_cache.add(user_id)
-            # Получаем email
-            email = await conn.fetchval(
-                "SELECT email FROM users WHERE users_id = $1",
-                str(user_id)  # И здесь тоже строка
-            )
-            if email:
-                users_email_cache[user_id] = email
-        
-        return bool(result)
+            users_email_cache[user_id] = result['email']
+            logger.info(f"Пользователь {user_id} найден в БД и добавлен в кэш")
+            return True
+        else:
+            logger.debug(f"Пользователь {user_id} не найден в БД")
+            return False
         
     except Exception as e:
         logger.error(f"Ошибка проверки авторизации: {e}")
         return False
     finally:
-        await conn.close()
-
+        release_db_connection(conn)
 
 async def add_authorized_user(user_id: int, email: str) -> bool:
     """Добавляет пользователя в БД и кэш."""
-    # Добавляем в кэш сразу
-    authorized_users_cache.add(user_id)
-    users_email_cache[user_id] = email
+    logger.info(f"Добавление пользователя {user_id} с email {email}")
     
-    # Пытаемся добавить в БД
+    # Сначала пытаемся добавить в БД
     conn = await get_db_connection()
     if not conn:
         logger.warning(f"БД недоступна, пользователь {user_id} добавлен только в кэш")
-        return True  # Считаем успехом, так как в кэше есть
+        # Добавляем в кэш даже если БД недоступна
+        authorized_users_cache.add(user_id)
+        users_email_cache[user_id] = email
+        return True
     
     try:
-        # ИСПРАВЛЕНО: преобразуем user_id в строку
+        # Используем ON CONFLICT для обработки дубликатов
         await conn.execute(
-            "INSERT INTO users (users_id, email) VALUES ($1, $2) ON CONFLICT (users_id) DO UPDATE SET email = $2",
-            str(user_id), email  # Преобразуем в строку
+            """INSERT INTO users (users_id, email) 
+               VALUES ($1, $2) 
+               ON CONFLICT (users_id) 
+               DO UPDATE SET email = EXCLUDED.email, created_at = CURRENT_TIMESTAMP""",
+            user_id, email
         )
-        logger.info(f"Пользователь {user_id} добавлен в БД")
+        
+        # Добавляем в кэш после успешной записи в БД
+        authorized_users_cache.add(user_id)
+        users_email_cache[user_id] = email
+        
+        logger.info(f"✅ Пользователь {user_id} успешно добавлен в БД и кэш")
         return True
         
     except Exception as e:
-        logger.error(f"Ошибка добавления пользователя в БД: {e}")
-        return True  # Пользователь все равно в кэше
+        logger.error(f"❌ Ошибка добавления пользователя в БД: {e}")
+        # Добавляем в кэш, даже если БД не работает
+        authorized_users_cache.add(user_id)
+        users_email_cache[user_id] = email
+        return True
     finally:
-        await conn.close()
+        release_db_connection(conn)
 
 async def remove_authorized_user(user_id: int) -> bool:
     """Удаляет пользователя из БД и кэша."""
+    logger.info(f"Удаление пользователя {user_id}")
+    
     # Удаляем из кэша
     authorized_users_cache.discard(user_id)
     users_email_cache.pop(user_id, None)
@@ -279,16 +318,15 @@ async def remove_authorized_user(user_id: int) -> bool:
         return True
     
     try:
-        # ИСПРАВЛЕНО: преобразуем user_id в строку
-        await conn.execute('DELETE FROM users WHERE users_id = $1', str(user_id))
-        logger.info(f"Пользователь {user_id} удален из БД")
+        result = await conn.execute('DELETE FROM users WHERE users_id = $1', user_id)
+        logger.info(f"✅ Пользователь {user_id} удален из БД (затронуто строк: {result})")
         return True
         
     except Exception as e:
-        logger.error(f"Ошибка удаления пользователя: {e}")
-        return True  # Из кэша удален
+        logger.error(f"❌ Ошибка удаления пользователя: {e}")
+        return True  # Из кэша удален в любом случае
     finally:
-        await conn.close()
+        release_db_connection(conn)
 
 def is_valid_email(email: str) -> bool:
     """Проверяет валидность email."""
@@ -484,7 +522,7 @@ async def cancel_logout(callback_query: types.CallbackQuery):
 
 @dp.message_handler(commands=['dbtest'])
 async def db_test_command(message: types.Message):
-    """Тестирование подключения к БД (только для отладки)."""
+    """Тестирование подключения к БД."""
     await message.answer("🔍 Тестирую подключение к БД...")
     
     conn = await get_db_connection()
@@ -493,31 +531,52 @@ async def db_test_command(message: types.Message):
             # Тестируем различные запросы
             version = await conn.fetchval("SELECT version()")
             current_db = await conn.fetchval("SELECT current_database()")
-            user_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+            
+            # Проверяем таблицу users
+            table_exists = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'users'
+                )
+            """)
+            
+            if table_exists:
+                user_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+                sample_users = await conn.fetch("SELECT users_id, email, created_at FROM users LIMIT 3")
+                
+                sample_text = "\n".join([
+                    f"• ID: {row['users_id']}, Email: {row['email'][:20]}..."
+                    for row in sample_users
+                ]) if sample_users else "• Нет пользователей"
+            else:
+                user_count = "Таблица не существует"
+                sample_text = "Таблица users не найдена"
             
             result = f"""✅ Подключение к БД успешно!
             
 📊 Информация о БД:
 • База данных: {current_db}
+• Таблица users: {'существует' if table_exists else 'не существует'}
 • Пользователей в БД: {user_count}
 • Пользователей в кэше: {len(authorized_users_cache)}
 
-🔧 Версия PostgreSQL:  
+👥 Примеры пользователей:
+{sample_text}
+
+🔧 PostgreSQL версия:  
 {version[:100]}..."""
             
         except Exception as e:
             result = f"❌ Ошибка при тестировании: {type(e).__name__}: {e}"
         finally:
-            await conn.close()
+            release_db_connection(conn)
     else:
         result = """❌ Не удалось подключиться к БД
         
 🔍 Возможные причины:
-• Сервер PostgreSQL не запущен
+• Сервер PostgreSQL недоступен
 • Неверная строка подключения  
-• База данных не существует
-• Неверный логин/пароль
-• Проблемы с сетью"""
+• Проблемы с сетью или аутентификацией"""
     
     await message.answer(result)
 
@@ -537,14 +596,15 @@ async def status_command(message: types.Message):
         except Exception as e:
             db_status = f"❌ БД: ошибка - {e}"
         finally:
-            await conn.close()
+            release_db_connection(conn)
     else:
         db_status = "❌ БД: недоступна"
     
     status_text = f"""📊 Статус системы:
 📦 Кэш: {cache_count} пользователей
 {db_status}
-👤 Ваш статус: {'✅ авторизован' if in_cache else '❌ не авторизован'}"""
+👤 Ваш статус: {'✅ авторизован' if in_cache else '❌ не авторизован'}
+🆔 Ваш ID: {user_id}"""
     
     await message.answer(status_text)
 
@@ -559,47 +619,34 @@ async def on_startup(dp):
     """Инициализация при запуске бота."""
     logger.info("🚀 Запуск бота...")
     
-    # Выводим информацию о подключении
-    logger.info(f"📡 Строка подключения: {DATABASE_URL}")
+    # Инициализируем пул соединений
+    pool_created = await init_db_pool()
     
-    # Пробуем подключиться и создать таблицу
-    conn = await get_db_connection()
-    if conn:
-        try:
-            logger.info("✅ Подключение к БД установлено")
-            
-            # ИСПРАВЛЕНО: users_id как TEXT вместо BIGINT
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    users_id TEXT UNIQUE NOT NULL,
-                    email VARCHAR(255) NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            logger.info("✅ Таблица users готова")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка при создании таблицы: {type(e).__name__}: {e}")
-        finally:
-            await conn.close()
+    if pool_created:
+        # Создаем таблицу если не существует
+        table_created = await ensure_table_exists()
         
-        # Загружаем пользователей в кэш
-        await load_authorized_users()
-        
+        if table_created:
+            # Загружаем пользователей в кэш
+            await load_authorized_users()
+        else:
+            logger.error("❌ Не удалось создать/проверить таблицу users")
     else:
         logger.warning("⚠️ БД недоступна при запуске - работаем только с кэшем")
-        logger.info("ℹ️ Проверьте:")
-        logger.info("   1. Запущен ли сервер PostgreSQL")
-        logger.info("   2. Правильность строки подключения")
-        logger.info("   3. Существует ли база данных 'sber_bot'")
-        logger.info("   4. Правильность логина/пароля")
     
     logger.info("✅ Бот готов к работе")
+
+async def on_shutdown(dp):
+    """Закрытие соединений при остановке бота."""
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        logger.info("✅ Пул соединений закрыт")
 
 if __name__ == '__main__':
     executor.start_polling(
         dp, 
         skip_updates=True, 
-        on_startup=on_startup
+        on_startup=on_startup,
+        on_shutdown=on_shutdown
     )
