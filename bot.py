@@ -182,11 +182,11 @@ async def ensure_table_exists():
         """)
         
         if not table_exists:
-            # Создаем таблицу с правильной структурой
+            # Создаем таблицу с TEXT для users_id (как в оригинале)
             await conn.execute("""
                 CREATE TABLE users (
                     id SERIAL PRIMARY KEY,
-                    users_id BIGINT UNIQUE NOT NULL,
+                    users_id TEXT UNIQUE NOT NULL,
                     email VARCHAR(255) NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -247,10 +247,11 @@ async def load_authorized_users():
         users_email_cache.clear()
         
         for user in users:
-            user_id = int(user['users_id'])
+            user_id_str = user['users_id']  # Это строка из БД
+            user_id_int = int(user_id_str)   # Преобразуем в int для кэша
             email = user['email']
-            authorized_users_cache.add(user_id)
-            users_email_cache[user_id] = email
+            authorized_users_cache.add(user_id_int)
+            users_email_cache[user_id_int] = email
         
         logger.info(f"✅ Загружено {len(authorized_users_cache)} пользователей в кэш")
         return True
@@ -275,9 +276,10 @@ async def check_user_authorized(user_id: int) -> bool:
         return False
     
     try:
+        # Преобразуем user_id в строку для запроса к БД
         result = await conn.fetchrow(
             "SELECT users_id, email FROM users WHERE users_id = $1",
-            user_id
+            str(user_id)  # Преобразуем в строку
         )
         
         if result:
@@ -310,10 +312,13 @@ async def add_authorized_user(user_id: int, email: str) -> bool:
         return True
     
     try:
+        # Преобразуем user_id в строку для БД
+        user_id_str = str(user_id)
+        
         # Сначала проверяем, есть ли уже такой пользователь
         existing_user = await conn.fetchrow(
             "SELECT users_id, email FROM users WHERE users_id = $1",
-            user_id
+            user_id_str
         )
         
         if existing_user:
@@ -321,7 +326,7 @@ async def add_authorized_user(user_id: int, email: str) -> bool:
             if existing_user['email'] != email:
                 await conn.execute(
                     "UPDATE users SET email = $1, created_at = CURRENT_TIMESTAMP WHERE users_id = $2",
-                    email, user_id
+                    email, user_id_str
                 )
                 logger.info(f"✅ Email пользователя {user_id} обновлен")
             else:
@@ -330,7 +335,7 @@ async def add_authorized_user(user_id: int, email: str) -> bool:
             # Добавляем нового пользователя
             await conn.execute(
                 "INSERT INTO users (users_id, email) VALUES ($1, $2)",
-                user_id, email
+                user_id_str, email
             )
             logger.info(f"✅ Пользователь {user_id} добавлен в БД")
         
@@ -364,7 +369,8 @@ async def remove_authorized_user(user_id: int) -> bool:
         return True
     
     try:
-        result = await conn.execute('DELETE FROM users WHERE users_id = $1', user_id)
+        # Преобразуем user_id в строку для БД
+        result = await conn.execute('DELETE FROM users WHERE users_id = $1', str(user_id))
         logger.info(f"✅ Пользователь {user_id} удален из БД (затронуто строк: {result})")
         return True
         
