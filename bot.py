@@ -27,7 +27,7 @@ EMAIL_USER = os.getenv('EMAIL_USER', 'glebsem2005@gmail.com')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', 'kqbkhnqpskiumddc')
 
 # База данных - можно изменить параметры подключения
-DATABASE_URL = "postgresql://bot_admin:npg_Mac0G8fzWZpD@ep-rapid-field-ab5yifrd.eu-west-2.aws.neon.tech/sber_bot?sslmode=require&channel_binding=require"
+DATABASE_URL = "postgresql://neondb_owner:npg_csN5jxi3oqYK@ep-rapid-field-ab5yifrd.eu-west-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 # Альтернативные варианты подключения (раскомментируйте нужный):
 # DATABASE_URL = "postgresql://bot_admin:sber@localhost:5432/sber_bot"  # если БД локально
