@@ -166,10 +166,11 @@ async def load_authorized_users():
         
         if not table_exists:
             logger.warning("⚠️ Таблица 'users' не существует, создаем...")
+            # ИСПРАВЛЕНО: users_id как TEXT
             await conn.execute("""
                 CREATE TABLE users (
                     id SERIAL PRIMARY KEY,
-                    users_id BIGINT UNIQUE NOT NULL,
+                    users_id TEXT UNIQUE NOT NULL,
                     email VARCHAR(255) NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -185,10 +186,11 @@ async def load_authorized_users():
         users_email_cache.clear()
         
         for user in users:
-            user_id = user['users_id']
+            user_id_str = user['users_id']  # Это строка
+            user_id_int = int(user_id_str)   # Преобразуем в int для кэша
             email = user['email']
-            authorized_users_cache.add(user_id)
-            users_email_cache[user_id] = email
+            authorized_users_cache.add(user_id_int)
+            users_email_cache[user_id_int] = email
         
         logger.info(f"✅ Загружено {len(authorized_users_cache)} пользователей в кэш")
         
@@ -196,6 +198,7 @@ async def load_authorized_users():
         logger.error(f"❌ Ошибка загрузки пользователей: {type(e).__name__}: {e}")
     finally:
         await conn.close()
+
 
 async def check_user_authorized(user_id: int) -> bool:
     """Проверяет авторизацию пользователя (сначала кэш, потом БД)."""
@@ -210,9 +213,10 @@ async def check_user_authorized(user_id: int) -> bool:
         return False
     
     try:
+        # ИСПРАВЛЕНО: преобразуем user_id в строку
         result = await conn.fetchval(
             "SELECT EXISTS(SELECT 1 FROM users WHERE users_id = $1)",
-            user_id
+            str(user_id)  # Преобразуем в строку
         )
         
         if result:
@@ -221,7 +225,7 @@ async def check_user_authorized(user_id: int) -> bool:
             # Получаем email
             email = await conn.fetchval(
                 "SELECT email FROM users WHERE users_id = $1",
-                user_id
+                str(user_id)  # И здесь тоже строка
             )
             if email:
                 users_email_cache[user_id] = email
@@ -233,6 +237,7 @@ async def check_user_authorized(user_id: int) -> bool:
         return False
     finally:
         await conn.close()
+
 
 async def add_authorized_user(user_id: int, email: str) -> bool:
     """Добавляет пользователя в БД и кэш."""
@@ -247,9 +252,10 @@ async def add_authorized_user(user_id: int, email: str) -> bool:
         return True  # Считаем успехом, так как в кэше есть
     
     try:
+        # ИСПРАВЛЕНО: преобразуем user_id в строку
         await conn.execute(
             "INSERT INTO users (users_id, email) VALUES ($1, $2) ON CONFLICT (users_id) DO UPDATE SET email = $2",
-            user_id, email
+            str(user_id), email  # Преобразуем в строку
         )
         logger.info(f"Пользователь {user_id} добавлен в БД")
         return True
@@ -273,7 +279,8 @@ async def remove_authorized_user(user_id: int) -> bool:
         return True
     
     try:
-        await conn.execute('DELETE FROM users WHERE users_id = $1', user_id)
+        # ИСПРАВЛЕНО: преобразуем user_id в строку
+        await conn.execute('DELETE FROM users WHERE users_id = $1', str(user_id))
         logger.info(f"Пользователь {user_id} удален из БД")
         return True
         
@@ -561,11 +568,11 @@ async def on_startup(dp):
         try:
             logger.info("✅ Подключение к БД установлено")
             
-            # Проверяем и создаем таблицу
+            # ИСПРАВЛЕНО: users_id как TEXT вместо BIGINT
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
-                    users_id BIGINT UNIQUE NOT NULL,
+                    users_id TEXT UNIQUE NOT NULL,
                     email VARCHAR(255) NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
