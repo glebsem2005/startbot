@@ -26,8 +26,12 @@ SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
 EMAIL_USER = os.getenv('EMAIL_USER', 'glebsem2005@gmail.com')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', 'kqbkhnqpskiumddc')
 
-# База данных
+# База данных - можно изменить параметры подключения
 DATABASE_URL = "postgresql://bot_admin:sber@172.20.10.13:5432/sber_bot"
+
+# Альтернативные варианты подключения (раскомментируйте нужный):
+# DATABASE_URL = "postgresql://bot_admin:sber@localhost:5432/sber_bot"  # если БД локально
+# DATABASE_URL = "postgresql://postgres:password@localhost:5432/sber_bot"  # стандартные настройки
 
 # Боты для перенаправления
 STRATEGIES = {
@@ -111,25 +115,68 @@ class EmailSender:
 email_sender = EmailSender()
 
 async def get_db_connection():
-    """Создает новое подключение к БД."""
+    """Создает новое подключение к БД с детальной диагностикой."""
     try:
+        logger.info(f"Попытка подключения к БД: {DATABASE_URL}")
+        
         conn = await asyncio.wait_for(
             asyncpg.connect(DATABASE_URL), 
-            timeout=10.0
+            timeout=15.0
         )
+        
+        # Тестируем подключение
+        await conn.fetchval("SELECT 1")
+        logger.info("✅ Подключение к БД успешно")
         return conn
+        
+    except asyncio.TimeoutError:
+        logger.error("❌ Таймаут подключения к БД (15 сек)")
+        return None
+    except asyncpg.InvalidCatalogNameError:
+        logger.error("❌ База данных 'sber_bot' не существует")
+        return None
+    except asyncpg.InvalidPasswordError:
+        logger.error("❌ Неверный пароль для пользователя БД")
+        return None
+    except asyncpg.ConnectionDoesNotExistError:
+        logger.error("❌ Не удается подключиться к серверу БД")
+        return None
     except Exception as e:
-        logger.error(f"Ошибка подключения к БД: {e}")
+        logger.error(f"❌ Неизвестная ошибка подключения к БД: {type(e).__name__}: {e}")
         return None
 
 async def load_authorized_users():
     """Загружает авторизованных пользователей из БД в кэш."""
+    logger.info("Попытка загрузки пользователей из БД...")
+    
     conn = await get_db_connection()
     if not conn:
-        logger.warning("Не удалось подключиться к БД для загрузки пользователей")
+        logger.warning("❌ Не удалось подключиться к БД для загрузки пользователей")
+        logger.info("ℹ️ Бот будет работать только с локальным кэшем")
         return
     
     try:
+        # Сначала проверим, существует ли таблица
+        table_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'users'
+            )
+        """)
+        
+        if not table_exists:
+            logger.warning("⚠️ Таблица 'users' не существует, создаем...")
+            await conn.execute("""
+                CREATE TABLE users (
+                    id SERIAL PRIMARY KEY,
+                    users_id BIGINT UNIQUE NOT NULL,
+                    email VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            logger.info("✅ Таблица 'users' создана")
+            return
+        
         # Загружаем всех пользователей
         users = await conn.fetch("SELECT users_id, email FROM users")
         
@@ -143,10 +190,10 @@ async def load_authorized_users():
             authorized_users_cache.add(user_id)
             users_email_cache[user_id] = email
         
-        logger.info(f"Загружено {len(authorized_users_cache)} пользователей в кэш")
+        logger.info(f"✅ Загружено {len(authorized_users_cache)} пользователей в кэш")
         
     except Exception as e:
-        logger.error(f"Ошибка загрузки пользователей: {e}")
+        logger.error(f"❌ Ошибка загрузки пользователей: {type(e).__name__}: {e}")
     finally:
         await conn.close()
 
@@ -428,6 +475,45 @@ async def cancel_logout(callback_query: types.CallbackQuery):
         "Вы остались авторизованы. Используйте /start для доступа к стратегиям."
     )
 
+@dp.message_handler(commands=['dbtest'])
+async def db_test_command(message: types.Message):
+    """Тестирование подключения к БД (только для отладки)."""
+    await message.answer("🔍 Тестирую подключение к БД...")
+    
+    conn = await get_db_connection()
+    if conn:
+        try:
+            # Тестируем различные запросы
+            version = await conn.fetchval("SELECT version()")
+            current_db = await conn.fetchval("SELECT current_database()")
+            user_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+            
+            result = f"""✅ Подключение к БД успешно!
+            
+📊 Информация о БД:
+• База данных: {current_db}
+• Пользователей в БД: {user_count}
+• Пользователей в кэше: {len(authorized_users_cache)}
+
+🔧 Версия PostgreSQL:  
+{version[:100]}..."""
+            
+        except Exception as e:
+            result = f"❌ Ошибка при тестировании: {type(e).__name__}: {e}"
+        finally:
+            await conn.close()
+    else:
+        result = """❌ Не удалось подключиться к БД
+        
+🔍 Возможные причины:
+• Сервер PostgreSQL не запущен
+• Неверная строка подключения  
+• База данных не существует
+• Неверный логин/пароль
+• Проблемы с сетью"""
+    
+    await message.answer(result)
+
 @dp.message_handler(commands=['status'])
 async def status_command(message: types.Message):
     """Проверка статуса кэша и БД."""
@@ -466,10 +552,16 @@ async def on_startup(dp):
     """Инициализация при запуске бота."""
     logger.info("🚀 Запуск бота...")
     
-    # Создаем таблицу если её нет
+    # Выводим информацию о подключении
+    logger.info(f"📡 Строка подключения: {DATABASE_URL}")
+    
+    # Пробуем подключиться и создать таблицу
     conn = await get_db_connection()
     if conn:
         try:
+            logger.info("✅ Подключение к БД установлено")
+            
+            # Проверяем и создаем таблицу
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -480,17 +572,23 @@ async def on_startup(dp):
             """)
             logger.info("✅ Таблица users готова")
             
-            # Загружаем пользователей в кэш
-            await load_authorized_users()
-            
         except Exception as e:
-            logger.error(f"Ошибка инициализации БД: {e}")
+            logger.error(f"❌ Ошибка при создании таблицы: {type(e).__name__}: {e}")
         finally:
             await conn.close()
+        
+        # Загружаем пользователей в кэш
+        await load_authorized_users()
+        
     else:
-        logger.warning("⚠️ БД недоступна при запуске")
+        logger.warning("⚠️ БД недоступна при запуске - работаем только с кэшем")
+        logger.info("ℹ️ Проверьте:")
+        logger.info("   1. Запущен ли сервер PostgreSQL")
+        logger.info("   2. Правильность строки подключения")
+        logger.info("   3. Существует ли база данных 'sber_bot'")
+        logger.info("   4. Правильность логина/пароля")
     
-    logger.info("✅ Бот запущен")
+    logger.info("✅ Бот готов к работе")
 
 if __name__ == '__main__':
     executor.start_polling(
