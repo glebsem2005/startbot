@@ -173,17 +173,49 @@ async def ensure_table_exists():
         return False
     
     try:
-        # Создаем таблицу с правильной структурой
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                users_id BIGINT UNIQUE NOT NULL,
-                email VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        # Проверяем существование таблицы
+        table_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'users'
             )
         """)
         
-        # Создаем индекс для быстрого поиска
+        if not table_exists:
+            # Создаем таблицу с правильной структурой
+            await conn.execute("""
+                CREATE TABLE users (
+                    id SERIAL PRIMARY KEY,
+                    users_id BIGINT UNIQUE NOT NULL,
+                    email VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            logger.info("✅ Таблица users создана")
+        else:
+            # Проверяем и добавляем ограничение уникальности если его нет
+            constraint_exists = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints 
+                    WHERE table_name = 'users' 
+                    AND constraint_type = 'UNIQUE'
+                    AND constraint_name LIKE '%users_id%'
+                )
+            """)
+            
+            if not constraint_exists:
+                logger.info("Добавляем ограничение уникальности для users_id...")
+                try:
+                    await conn.execute("""
+                        ALTER TABLE users 
+                        ADD CONSTRAINT users_users_id_unique UNIQUE (users_id)
+                    """)
+                    logger.info("✅ Ограничение уникальности добавлено")
+                except Exception as e:
+                    if "already exists" not in str(e).lower():
+                        logger.error(f"Ошибка добавления ограничения: {e}")
+        
+        # Создаем индекс для быстрого поиска (если еще не существует)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_users_users_id ON users(users_id)
         """)
@@ -192,7 +224,7 @@ async def ensure_table_exists():
         return True
         
     except Exception as e:
-        logger.error(f"❌ Ошибка создания таблицы: {e}")
+        logger.error(f"❌ Ошибка создания/проверки таблицы: {e}")
         return False
     finally:
         release_db_connection(conn)
@@ -278,20 +310,34 @@ async def add_authorized_user(user_id: int, email: str) -> bool:
         return True
     
     try:
-        # Используем ON CONFLICT для обработки дубликатов
-        await conn.execute(
-            """INSERT INTO users (users_id, email) 
-               VALUES ($1, $2) 
-               ON CONFLICT (users_id) 
-               DO UPDATE SET email = EXCLUDED.email, created_at = CURRENT_TIMESTAMP""",
-            user_id, email
+        # Сначала проверяем, есть ли уже такой пользователь
+        existing_user = await conn.fetchrow(
+            "SELECT users_id, email FROM users WHERE users_id = $1",
+            user_id
         )
+        
+        if existing_user:
+            # Пользователь уже существует, обновляем email если изменился
+            if existing_user['email'] != email:
+                await conn.execute(
+                    "UPDATE users SET email = $1, created_at = CURRENT_TIMESTAMP WHERE users_id = $2",
+                    email, user_id
+                )
+                logger.info(f"✅ Email пользователя {user_id} обновлен")
+            else:
+                logger.info(f"✅ Пользователь {user_id} уже существует в БД")
+        else:
+            # Добавляем нового пользователя
+            await conn.execute(
+                "INSERT INTO users (users_id, email) VALUES ($1, $2)",
+                user_id, email
+            )
+            logger.info(f"✅ Пользователь {user_id} добавлен в БД")
         
         # Добавляем в кэш после успешной записи в БД
         authorized_users_cache.add(user_id)
         users_email_cache[user_id] = email
         
-        logger.info(f"✅ Пользователь {user_id} успешно добавлен в БД и кэш")
         return True
         
     except Exception as e:
@@ -540,6 +586,18 @@ async def db_test_command(message: types.Message):
                 )
             """)
             
+            # Проверяем ограничения
+            constraints = await conn.fetch("""
+                SELECT constraint_name, constraint_type 
+                FROM information_schema.table_constraints 
+                WHERE table_name = 'users'
+            """)
+            
+            constraint_info = "\n".join([
+                f"• {row['constraint_name']}: {row['constraint_type']}"
+                for row in constraints
+            ]) if constraints else "• Нет ограничений"
+            
             if table_exists:
                 user_count = await conn.fetchval("SELECT COUNT(*) FROM users")
                 sample_users = await conn.fetch("SELECT users_id, email, created_at FROM users LIMIT 3")
@@ -560,6 +618,9 @@ async def db_test_command(message: types.Message):
 • Пользователей в БД: {user_count}
 • Пользователей в кэше: {len(authorized_users_cache)}
 
+🔒 Ограничения таблицы:
+{constraint_info}
+
 👥 Примеры пользователей:
 {sample_text}
 
@@ -579,6 +640,18 @@ async def db_test_command(message: types.Message):
 • Проблемы с сетью или аутентификацией"""
     
     await message.answer(result)
+
+@dp.message_handler(commands=['fixdb'])
+async def fix_db_command(message: types.Message):
+    """Команда для починки структуры БД."""
+    await message.answer("🔧 Проверяю и исправляю структуру БД...")
+    
+    success = await ensure_table_exists()
+    
+    if success:
+        await message.answer("✅ Структура БД проверена и исправлена!\n\nВыполните /dbtest для проверки.")
+    else:
+        await message.answer("❌ Не удалось исправить структуру БД. Проверьте логи.")
 
 @dp.message_handler(commands=['status'])
 async def status_command(message: types.Message):
