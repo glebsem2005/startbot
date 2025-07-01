@@ -27,7 +27,7 @@ EMAIL_USER = os.getenv('EMAIL_USER', 'glebsem2005@gmail.com')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', 'kqbkhnqpskiumddc')
 
 # База данных
-DATABASE_URL = "postgresql://postgres:jNtiIokjoySRemHIhgvjunFtmBLaRYLr@switchyard.proxy.rlwy.net:17143/railway"
+DATABASE_URL = "postgresql://postgres:QynuLMnRNPWupmbDGndBwkgrUAdXZxcG@shortline.proxy.rlwy.net:54776/railway"
 
 # Боты для перенаправления
 STRATEGIES = {
@@ -401,9 +401,9 @@ async def start(message: types.Message):
     else:
         logger.info(f'❌ Пользователь {user_id} не авторизован, запрашиваем email')
         await message.answer(
-            "👋 Добро пожаловать в Сбер CPNB Bot!\n\n"
+            "Добро пожаловать в Сбер CPNB Bot!\n\n"
             "Для доступа к боту необходима авторизация.\n"
-            "📧 Введите ваш email для получения кода подтверждения:"
+            "Введите ваш email для получения кода подтверждения:"
         )
         await UserStates.WAITING_EMAIL.set()
 
