@@ -17,7 +17,6 @@ import os
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Токен вашего бота-маршрутизатора
 TOKEN = '8182061892:AAHnfK9k5g4gaaUlEK8plhdFdVHKzHQzYg4'
 
 # Email настройки
@@ -33,7 +32,7 @@ DATABASE_URL = "postgresql://postgres:QynuLMnRNPWupmbDGndBwkgrUAdXZxcG@shortline
 STRATEGIES = {
     'Анализ инвестиционной привлекательности': 'sber_CPNB_investment_bot',
     'Скаутинг стартапов': 'sber_startups_bot',
-    'Подготовка сделки': 'sber_investment_bot',
+    'Анализ рынка' : 'sber_CPNB_market_bot'
 }
 
 bot = Bot(token=TOKEN)
@@ -457,8 +456,8 @@ async def process_email(message: types.Message, state: FSMContext):
     )
     
     await message.answer(
-        f"✅ Код отправлен на {email}\n\n"
-        "🔢 Введите 6-значный код из письма:"
+        f"Код отправлен на {email}\n\n"
+        "Введите 6-значный код из письма:"
     )
     await UserStates.WAITING_CODE.set()
 
@@ -483,12 +482,12 @@ async def process_verification_code(message: types.Message, state: FSMContext):
     success = await add_authorized_user(user_id, email)
     
     if success:
-        await message.answer("✅ Авторизация успешна!")
+        await message.answer("Авторизация успешна!")
         await state.finish()
         await show_strategies(message)
     else:
         await message.answer(
-            "❌ Ошибка при авторизации.\n"
+            "Ошибка при авторизации.\n"
             "Попробуйте еще раз позже или обратитесь к администратору."
         )
         await state.finish()
@@ -504,7 +503,7 @@ async def process_logout(callback_query: types.CallbackQuery):
     
     if success:
         await callback_query.message.edit_text(
-            "🚪 Вы успешно вышли из аккаунта!\n\n"
+            "Вы успешно вышли из аккаунта!\n\n"
             "Для повторного входа отправьте команду /start"
         )
         logger.info(f"Пользователь {user_id} вышел из аккаунта")
@@ -533,12 +532,12 @@ async def logout_command(message: types.Message):
     # Создаем клавиатуру подтверждения
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
-        types.InlineKeyboardButton("✅ Да", callback_data="confirm_logout"),
-        types.InlineKeyboardButton("❌ Нет", callback_data="cancel_logout")
+        types.InlineKeyboardButton("Да", callback_data="confirm_logout"),
+        types.InlineKeyboardButton("Нет", callback_data="cancel_logout")
     )
     
     await message.answer(
-        "🚪 Вы уверены, что хотите выйти из аккаунта?\n\n"
+        "Вы уверены, что хотите выйти из аккаунта?\n\n"
         "После выхода потребуется повторная авторизация по email.",
         reply_markup=keyboard
     )
@@ -554,7 +553,7 @@ async def confirm_logout(callback_query: types.CallbackQuery):
     
     if success:
         await callback_query.message.edit_text(
-            "✅ Вы успешно вышли из аккаунта!\n\n"
+            "Вы успешно вышли из аккаунта!\n\n"
             "Для повторного входа отправьте команду /start"
         )
     else:
